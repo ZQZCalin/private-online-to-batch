@@ -118,6 +118,9 @@ We stick to the notation in the paper, with k = 1 (i.e., beta_t = t).
 
 
 def train_step_private(epoch, sigma, k, OCO, OTB, trainloader, criterion, optimizer, device):
+    # ***test mode***
+    # Set test mode to "True" if using test mode.
+    TEST_MODE = True
     '''
     Train single epoch with differential privacy guarantees.
     '''
@@ -149,16 +152,20 @@ def train_step_private(epoch, sigma, k, OCO, OTB, trainloader, criterion, optimi
 
         # 1) gradient at last iteration: \nabla\ell(x_{t-1}, z_t)
         # we need to compute it before we update x_t = x_{t-1} + (w_t-x_{t-1})*2/(t-1)
-        OTB.zero_grad()
-        outputs = OTB(inputs)
-        loss = criterion(outputs, labels)
-        loss.backward()
-        # since we update g_t using:
-        # g_t = g_{t-1} + t \nabla\ell(x_t, z_t) - (t-1) \nabla\ell(x_{t-1}, z_t),
-        # we can subtract (t-1)*\nabla\ell(x_{t-1}, z_t) first.
-        if t > 1:
-            for p in OTB.parameters():
-                gradients[p] -= beta(t-1) * p.grad
+        # ***test mode***
+        # In test mode, we don't compute gradient difference, 
+        # so we jump this backprop block to save time.
+        if not TEST_MODE:
+            OTB.zero_grad()
+            outputs = OTB(inputs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            # since we update g_t using:
+            # g_t = g_{t-1} + t \nabla\ell(x_t, z_t) - (t-1) \nabla\ell(x_{t-1}, z_t),
+            # we can subtract (t-1)*\nabla\ell(x_{t-1}, z_t) first.
+            if t > 1:
+                for p in OTB.parameters():
+                    gradients[p] -= beta(t-1) * p.grad
 
         # 2) aggregate weight: x_t = x_{t-1} + (w_t-x_{t-1})*2/(t-1)
         for p in OTB.parameters():
@@ -180,7 +187,8 @@ def train_step_private(epoch, sigma, k, OCO, OTB, trainloader, criterion, optimi
             # For test purpose, we turn off gradient difference aggregation 
             # and set gradient directly to be \beta_t\nabla\ell(x_t,z_t).
             # Uncomment this line for test mode.
-            gradients[p] = beta(t) * p.grad
+            if TEST_MODE:
+                gradients[p] = beta(t) * p.grad
 
         # 4) optimize one step on OCO to update w_{t+1}
         optimizer.zero_grad()
