@@ -120,7 +120,7 @@ We stick to the notation in the paper, with k = 1 (i.e., beta_t = t).
 def train_step_private(epoch, sigma, k, OCO, OTB, trainloader, criterion, optimizer, device):
     # ***test mode***
     # Set test mode to "True" if using test mode.
-    TEST_MODE = True
+    TEST_MODE = False
     '''
     Train single epoch with differential privacy guarantees.
     '''
@@ -155,22 +155,21 @@ def train_step_private(epoch, sigma, k, OCO, OTB, trainloader, criterion, optimi
         # ***test mode***
         # In test mode, we don't compute gradient difference, 
         # so we jump this backprop block to save time.
-        if not TEST_MODE:
-            OTB.zero_grad()
+        OTB.zero_grad()
+        if (not TEST_MODE) and t > 1:
             outputs = OTB(inputs)
             loss = criterion(outputs, labels)
             loss.backward()
             # since we update g_t using:
             # g_t = g_{t-1} + t \nabla\ell(x_t, z_t) - (t-1) \nabla\ell(x_{t-1}, z_t),
             # we can subtract (t-1)*\nabla\ell(x_{t-1}, z_t) first.
-            if t > 1:
-                for p in OTB.parameters():
-                    gradients[p] -= beta(t-1) * p.grad
+            for p in OTB.parameters():
+                gradients[p] -= beta(t-1) * p.grad
 
         # 2) aggregate weight: x_t = x_{t-1} + (w_t-x_{t-1})*2/(t-1)
         for p in OTB.parameters():
             p_OCO = OTB_to_OCO[p]
-            p.data += (p_OCO.data - p.data) * beta(t) / sum([beta(i+1) for i in range(t)])
+            p.data.add_((p_OCO.data - p.data) * beta(t) / sum([beta(i+1) for i in range(t)]))
             # error: a leaf Variable that requires grad is being used in an in-place operation.
             # p.add_((p_OCO.data - p.data)/t)
 
@@ -188,18 +187,33 @@ def train_step_private(epoch, sigma, k, OCO, OTB, trainloader, criterion, optimi
             # and set gradient directly to be \beta_t\nabla\ell(x_t,z_t).
             # Uncomment this line for test mode.
             if TEST_MODE:
-                gradients[p] = beta(t) * p.grad
+                gradients[p] = p.grad
 
         # 4) optimize one step on OCO to update w_{t+1}
         optimizer.zero_grad()
         # we need to first copy the gradients g_t with noise to OCO
         for p in OCO.parameters():
-            p.grad = gradients[OCO_to_OTB[p]]
+            if p.grad is None:
+                p.grad = torch.zeros_like(p.data)
+            p.grad.copy_(gradients[OCO_to_OTB[p]])
+            '''
+            Caveat:
+            The following line assigns the pointer of g_t to p.grad, so 
+            each time we call `zero_grad()`, we set g_t to be zero.
+            As a solution, we need to use in-place operation `.copy_()`
+            to assign the value instead of the pointer (as above).
+            '''
+            # p.grad = gradients[OCO_to_OTB[p]]
+
             # following eq. (6), variance is constant if we choose k = 1,
             # so we just sample i.i.d. gaussian with variance \sigma^2.
             num_nodes = bin(t).count('1')
             for _ in range(num_nodes):
-                p.grad += sigma * torch.randn_like(p.grad)
+                p.grad.add_(sigma*torch.randn_like(p.grad))
+
+            # In the paper, learning rate of OCO scales with 1/\sqrt{t}\beta_t. 
+            # Therefore, to be consistent, we also scale down the gradients.
+            p.grad.div_(beta(t))
         optimizer.step()
 
         # stat updates
@@ -209,13 +223,23 @@ def train_step_private(epoch, sigma, k, OCO, OTB, trainloader, criterion, optimi
         correct += predicted.eq(labels).sum().item()        # correct predictions
         train_acc = 100*correct/total                       # average train acc
 
+        # evaluate the difference between g_t/\beta_t and \nabla\ell(x_t,z_t)
+        grad_diff = sum([torch.norm(p_OCO.grad - OCO_to_OTB[p_OCO].grad)**2 for p_OCO in OCO.parameters()]) ** 0.5
+        grad_norm = sum([torch.norm(p_OTB.grad)**2 for p_OTB in OTB.parameters()]) ** 0.5
+        diff_ratio = grad_diff / (grad_norm + 1e-8)
+
         pbar.set_description(f'epoch {epoch+1} batch {batch+1}: \
-            train loss {train_loss:.2f}, train acc: {train_acc:.2f}')
+            train loss {train_loss:.2f}, train acc: {train_acc:.2f}, \
+            gradient error: {grad_diff:.4f}/{grad_norm:.4f}, error ratio: {diff_ratio:.2f}')
+
+        try:
+            wandb.log({'grad_diff': grad_diff, 'grad_norm': grad_norm, 'diff_ratio': diff_ratio})
+        except:
+            pass
 
     # at the end, we need to clone OTB parameters to OCO
     for p in OCO.parameters():
-        p.data = OCO_to_OTB[p].data
-        # p.copy_(OCO_to_OTB[p])
+        p.data.copy_(OCO_to_OTB[p].data)
 
     # return stats
     return train_loss, train_acc
@@ -247,7 +271,13 @@ def train_private(sigma, k, net, trainloader, testloader, epochs, criterion, opt
 
         dict_append(stats, train_loss=train_loss, train_acc=train_acc, 
             test_loss=test_loss, test_acc=test_acc)
-        wandb.log({'train_loss': train_loss, 'train_acc': train_acc,
-            'test_loss': test_loss, 'test_acc': test_acc})
+        
+        # ***test mode***
+        # Turn off wandb because we run on local device.
+        try:
+            wandb.log({'train_loss': train_loss, 'train_acc': train_acc,
+                'test_loss': test_loss, 'test_acc': test_acc, 'epoch': epoch})
+        except:
+            pass
 
     return stats
